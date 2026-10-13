@@ -29,7 +29,7 @@ Le complément est un site statique, sans donnée sensible. Le plus simple : Git
 Compléments personnalisés → Ajouter à partir d'un fichier → `manifest.xml`.
 (L'intitulé exact des menus peut varier ; l'option peut être bloquée par la politique du tenant.)
 
-**Déploiement** : centre d'administration Microsoft 365 → Paramètres → Applications intégrées →
+**Déploiement** : https://aka.ms/olksideload
 Charger des applications personnalisées → Complément Office → fichier manifeste, puis choisis
 les utilisateurs. La propagation peut prendre de quelques minutes à plusieurs heures.
 
