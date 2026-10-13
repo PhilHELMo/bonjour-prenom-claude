@@ -78,45 +78,58 @@ function construireHtml(prenoms, formule) {
 }
 
 
-/* ---------- Insertion sans lignes vides parasites avant la signature ---------- */
+/* ---------- Suppression des lignes vides entre la formule de fin et la signature ---------- */
 
-const SELECTEUR_SIGNATURE =
-  '#Signature, #x_Signature, [id^="ms-outlook-mobile-signature"], [id^="x_ms-outlook-mobile-signature"]';
+function normaliser(s) {
+  return (s || '').replace(/[\s\u00a0]+/g, ' ').trim();
+}
 
+// Bloc « vide » = ne contient ni texte, ni image/tableau/lien, et n'est pas un repère d'Outlook (id=...)
 function estBlocVide(noeud) {
-  if (noeud.nodeType === 3) return noeud.textContent.trim() === '';
+  if (noeud.nodeType === 3) return normaliser(noeud.textContent) === '';
   if (noeud.nodeType !== 1) return true; // commentaires, etc.
-  return noeud.textContent.trim() === '' && !noeud.querySelector('img, table, hr, a');
+  if (noeud.id) return false; // Signature, appendonsend, divRplyFwdMsg…
+  return normaliser(noeud.textContent) === '' && !noeud.querySelector('img, table, hr, a, [id]');
 }
 
 /*
- * htmlCorps : corps actuel du message ; htmlInsere : notre bloc.
- * Renvoie le nouveau corps si le message est « vierge avec signature »
- * (uniquement des blocs vides avant la signature), sinon null :
- * l'appelant insère alors au curseur, sans toucher au reste.
+ * Repère la formule de fin que nous avons insérée (ex. « Bien à toi, ») et retire les
+ * blocs vides qui la suivent, jusqu'à la signature ou au contenu suivant.
+ * Renvoie le nouveau HTML, ou null s'il n'y a rien à changer.
  */
-function fusionnerAvecSignature(htmlCorps, htmlInsere) {
+function retirerLignesApresFormule(htmlCorps, formule) {
+  const cible = normaliser(formule);
   const doc = new DOMParser().parseFromString(htmlCorps, 'text/html');
-  const signature = doc.body.querySelector(SELECTEUR_SIGNATURE);
-  if (!signature) return null;
+  const candidats = Array.from(doc.body.querySelectorAll('div, p, span'))
+    .filter(e => normaliser(e.textContent) === cible);
+  if (!candidats.length) return null;
 
-  const aSupprimer = [];
-  let noeud = signature;
-  while (noeud && noeud !== doc.body) {
-    for (let p = noeud.previousSibling; p; p = p.previousSibling) {
-      if (!estBlocVide(p)) return null; // du texte a déjà été saisi
-      aSupprimer.push(p);
+  let formuleEl = candidats[0];
+  for (;;) { // descendre jusqu'à l'élément le plus profond qui porte la formule
+    const enfant = Array.from(formuleEl.children).find(e => normaliser(e.textContent) === cible);
+    if (!enfant) break;
+    formuleEl = enfant;
+  }
+
+  let modifie = false;
+  // <br> traînants dans le même bloc : « Bien à toi,<br><br> »
+  while (formuleEl.lastChild &&
+         ((formuleEl.lastChild.nodeType === 1 && formuleEl.lastChild.tagName === 'BR') ||
+          (formuleEl.lastChild.nodeType === 3 && normaliser(formuleEl.lastChild.textContent) === ''))) {
+    formuleEl.removeChild(formuleEl.lastChild);
+    modifie = true;
+  }
+
+  let noeud = formuleEl;
+  for (;;) {
+    while (noeud.nextSibling && estBlocVide(noeud.nextSibling)) {
+      noeud.parentNode.removeChild(noeud.nextSibling);
+      modifie = true;
     }
-    if (noeud.parentNode === doc.body) break;
+    if (noeud.nextSibling || !noeud.parentNode || noeud.parentNode === doc.body) break;
     noeud = noeud.parentNode;
   }
-  const racine = noeud; // enfant direct du body qui contient la signature
-  aSupprimer.forEach(n => n.parentNode && n.parentNode.removeChild(n));
-
-  const conteneur = doc.createElement('div');
-  conteneur.innerHTML = htmlInsere;
-  while (conteneur.firstChild) doc.body.insertBefore(conteneur.firstChild, racine);
-  return doc.body.innerHTML;
+  return modifie ? doc.body.innerHTML : null;
 }
 
 /* ---------- Interface ---------- */
@@ -169,21 +182,14 @@ if (typeof Office !== 'undefined') {
     });
   }
 
-  function insererAuCurseur(html, texte) {
+  function nettoyerApresInsertion(formule) {
     const corps = Office.context.mailbox.item.body;
-    corps.setSelectedDataAsync(html, { coercionType: Office.CoercionType.Html }, res => {
-      if (res.status === Office.AsyncResultStatus.Succeeded) {
-        dire('Texte inséré dans le message.');
-        return;
-      }
-      // Message en texte brut : on réessaie sans mise en forme
-      corps.setSelectedDataAsync(texte, { coercionType: Office.CoercionType.Text }, res2 => {
-        if (res2.status === Office.AsyncResultStatus.Succeeded) {
-          dire('Texte inséré dans le message.');
-        } else {
-          dire('Insertion impossible : ' + res2.error.message, true);
-        }
-      });
+    corps.getAsync(Office.CoercionType.Html, lecture => {
+      if (lecture.status !== Office.AsyncResultStatus.Succeeded) return;
+      let nouveau = null;
+      try { nouveau = retirerLignesApresFormule(lecture.value, formule); } catch (e) { /* ignoré */ }
+      if (nouveau === null) return;
+      corps.setAsync(nouveau, { coercionType: Office.CoercionType.Html }, () => {});
     });
   }
 
@@ -194,24 +200,18 @@ if (typeof Office !== 'undefined') {
     const texte = `${salutation(prenoms)}\n\n\n${formule}`;
     const corps = Office.context.mailbox.item.body;
 
-    // Nouveau message avec signature : on place notre bloc tout en haut et on retire
-    // les lignes vides que Outlook laisse entre le curseur et la signature.
-    corps.getAsync(Office.CoercionType.Html, lecture => {
-      if (lecture.status !== Office.AsyncResultStatus.Succeeded) {
-        insererAuCurseur(html, texte);
+    corps.setSelectedDataAsync(html, { coercionType: Office.CoercionType.Html }, res => {
+      if (res.status === Office.AsyncResultStatus.Succeeded) {
+        dire('Texte inséré dans le message.');
+        nettoyerApresInsertion(formule);
         return;
       }
-      let nouveauCorps = null;
-      try { nouveauCorps = fusionnerAvecSignature(lecture.value, html); } catch (e) { /* repli */ }
-      if (nouveauCorps === null) {
-        insererAuCurseur(html, texte);
-        return;
-      }
-      corps.setAsync(nouveauCorps, { coercionType: Office.CoercionType.Html }, res => {
-        if (res.status === Office.AsyncResultStatus.Succeeded) {
+      // Message en texte brut : on réessaie sans mise en forme
+      corps.setSelectedDataAsync(texte, { coercionType: Office.CoercionType.Text }, res2 => {
+        if (res2.status === Office.AsyncResultStatus.Succeeded) {
           dire('Texte inséré dans le message.');
         } else {
-          insererAuCurseur(html, texte);
+          dire('Insertion impossible : ' + res2.error.message, true);
         }
       });
     });
@@ -249,5 +249,5 @@ if (typeof Office !== 'undefined') {
 }
 
 if (typeof module !== 'undefined') {
-  module.exports = { prenomDepuisNom, prenomDepuisEmail, prenomDestinataire, joindre, salutation, construireHtml, fusionnerAvecSignature };
+  module.exports = { prenomDepuisNom, prenomDepuisEmail, prenomDestinataire, joindre, salutation, construireHtml, retirerLignesApresFormule };
 }
