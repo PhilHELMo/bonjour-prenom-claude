@@ -77,6 +77,48 @@ function construireHtml(prenoms, formule) {
   );
 }
 
+
+/* ---------- Insertion sans lignes vides parasites avant la signature ---------- */
+
+const SELECTEUR_SIGNATURE =
+  '#Signature, #x_Signature, [id^="ms-outlook-mobile-signature"], [id^="x_ms-outlook-mobile-signature"]';
+
+function estBlocVide(noeud) {
+  if (noeud.nodeType === 3) return noeud.textContent.trim() === '';
+  if (noeud.nodeType !== 1) return true; // commentaires, etc.
+  return noeud.textContent.trim() === '' && !noeud.querySelector('img, table, hr, a');
+}
+
+/*
+ * htmlCorps : corps actuel du message ; htmlInsere : notre bloc.
+ * Renvoie le nouveau corps si le message est « vierge avec signature »
+ * (uniquement des blocs vides avant la signature), sinon null :
+ * l'appelant insère alors au curseur, sans toucher au reste.
+ */
+function fusionnerAvecSignature(htmlCorps, htmlInsere) {
+  const doc = new DOMParser().parseFromString(htmlCorps, 'text/html');
+  const signature = doc.body.querySelector(SELECTEUR_SIGNATURE);
+  if (!signature) return null;
+
+  const aSupprimer = [];
+  let noeud = signature;
+  while (noeud && noeud !== doc.body) {
+    for (let p = noeud.previousSibling; p; p = p.previousSibling) {
+      if (!estBlocVide(p)) return null; // du texte a déjà été saisi
+      aSupprimer.push(p);
+    }
+    if (noeud.parentNode === doc.body) break;
+    noeud = noeud.parentNode;
+  }
+  const racine = noeud; // enfant direct du body qui contient la signature
+  aSupprimer.forEach(n => n.parentNode && n.parentNode.removeChild(n));
+
+  const conteneur = doc.createElement('div');
+  conteneur.innerHTML = htmlInsere;
+  while (conteneur.firstChild) doc.body.insertBefore(conteneur.firstChild, racine);
+  return doc.body.innerHTML;
+}
+
 /* ---------- Interface ---------- */
 
 if (typeof Office !== 'undefined') {
@@ -127,19 +169,52 @@ if (typeof Office !== 'undefined') {
     });
   }
 
+  function insererAuCurseur(html, texte) {
+    const corps = Office.context.mailbox.item.body;
+    corps.setSelectedDataAsync(html, { coercionType: Office.CoercionType.Html }, res => {
+      if (res.status === Office.AsyncResultStatus.Succeeded) {
+        dire('Texte inséré dans le message.');
+        return;
+      }
+      // Message en texte brut : on réessaie sans mise en forme
+      corps.setSelectedDataAsync(texte, { coercionType: Office.CoercionType.Text }, res2 => {
+        if (res2.status === Office.AsyncResultStatus.Succeeded) {
+          dire('Texte inséré dans le message.');
+        } else {
+          dire('Insertion impossible : ' + res2.error.message, true);
+        }
+      });
+    });
+  }
+
   function inserer() {
-    const html = construireHtml(prenomsSaisis(), formuleChoisie());
-    Office.context.mailbox.item.body.setSelectedDataAsync(
-      html,
-      { coercionType: Office.CoercionType.Html },
-      res => {
+    const prenoms = prenomsSaisis();
+    const formule = formuleChoisie();
+    const html = construireHtml(prenoms, formule);
+    const texte = `${salutation(prenoms)}\n\n\n${formule}`;
+    const corps = Office.context.mailbox.item.body;
+
+    // Nouveau message avec signature : on place notre bloc tout en haut et on retire
+    // les lignes vides que Outlook laisse entre le curseur et la signature.
+    corps.getAsync(Office.CoercionType.Html, lecture => {
+      if (lecture.status !== Office.AsyncResultStatus.Succeeded) {
+        insererAuCurseur(html, texte);
+        return;
+      }
+      let nouveauCorps = null;
+      try { nouveauCorps = fusionnerAvecSignature(lecture.value, html); } catch (e) { /* repli */ }
+      if (nouveauCorps === null) {
+        insererAuCurseur(html, texte);
+        return;
+      }
+      corps.setAsync(nouveauCorps, { coercionType: Office.CoercionType.Html }, res => {
         if (res.status === Office.AsyncResultStatus.Succeeded) {
           dire('Texte inséré dans le message.');
         } else {
-          dire('Insertion impossible : ' + res.error.message, true);
+          insererAuCurseur(html, texte);
         }
-      }
-    );
+      });
+    });
   }
 
   Office.onReady(info => {
@@ -174,5 +249,5 @@ if (typeof Office !== 'undefined') {
 }
 
 if (typeof module !== 'undefined') {
-  module.exports = { prenomDepuisNom, prenomDepuisEmail, prenomDestinataire, joindre, salutation, construireHtml };
+  module.exports = { prenomDepuisNom, prenomDepuisEmail, prenomDestinataire, joindre, salutation, construireHtml, fusionnerAvecSignature };
 }
